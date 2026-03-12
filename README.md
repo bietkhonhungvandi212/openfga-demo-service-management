@@ -1,10 +1,12 @@
-# Overview
+# Open FGA Demo
+
+## Overview
 
 This toy project is setup services management by openfga
 
-# Guidance setup
+## Guidance setup
 
-## Folder structure
+### Folder structure
 
 ```plaintext
 servicer-management/
@@ -16,19 +18,19 @@ servicer-management/
 │   └── service-model.fga
 │
 ├── service-internal/
-│   ├── Dockerfile
+│   ├── dockerfile
 │   ├── go.mod
 │   ├── go.sum
 │   └── main.go
 │
 └── service-caller/
-    ├── Dockerfile
+    ├── dockerfile
     ├── go.mod
     ├── go.sum
     └── main.go
 ```
 
-## Architecture
+### Architecture
 
 ```plaintext
 
@@ -57,7 +59,7 @@ servicer-management/
         +------------------+     +------------------+
 ```
 
-## Set up
+### Set up
 
 install OpenFGA CLI:
 
@@ -181,4 +183,3 @@ the response will be:
 ```json
 { "response": "{\"error\":\"Forbidden\"}ok", "service": "service-internal" }
 ```
-# repo
