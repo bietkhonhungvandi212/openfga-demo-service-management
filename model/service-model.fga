@@ -1,0 +1,6 @@
+model
+  schema 1.1
+
+type service
+  relations
+    define can_call: [service]

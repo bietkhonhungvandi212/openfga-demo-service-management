@@ -1,0 +1,62 @@
+version: "3.9"
+
+networks:
+  app-net:
+
+services:
+  openfga:
+    image: openfga/openfga:latest
+    command: run
+    ports:
+      - "8080:8080"
+    networks:
+      - app-net
+
+  service-internal:
+    build:
+      context: ./service-internal
+      dockerfile: dockerfile
+    container_name: service-internal
+    depends_on:
+      - openfga
+    environment:
+      PORT: "8080"
+      NAME: service-internal-a
+      OPENFGA_API: http://openfga:8080
+      STORE_ID: 01KKH8PP3KRM77KB8DF589EJ4K
+    ports:
+      - "8082:8080"
+    networks:
+      - app-net
+
+  service-caller-a:
+    build:
+      context: ./service-caller
+      dockerfile: Dockerfile
+    container_name: service-caller-a
+    depends_on:
+      - service-internal
+    environment:
+      PORT: "8081"
+      NAME: service-caller-a
+      SERVICE_INTERNAL_A_URL: http://service-internal:8080
+    ports:
+      - "8083:8081"
+    networks:
+      - app-net
+
+  service-caller-b:
+    build:
+      context: ./service-caller
+      dockerfile: Dockerfile
+    container_name: service-caller-b
+    depends_on:
+      - service-internal
+    environment:
+      PORT: "8081"
+      NAME: service-caller-b
+      SERVICE_INTERNAL_A_URL: http://service-internal:8080
+    ports:
+      - "8084:8081"
+    networks:
+      - app-net

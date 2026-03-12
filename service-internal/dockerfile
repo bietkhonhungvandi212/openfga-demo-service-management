@@ -1,0 +1,35 @@
+# -------- Stage 1: Build --------
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /app
+
+# Install git (needed for go modules sometimes)
+RUN apk add --no-cache git
+
+# Copy go mod files first (better cache)
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build binary
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o app .
+
+# -------- Stage 2: Runtime --------
+FROM alpine:3.19
+
+WORKDIR /app
+
+# Install CA certs for HTTPS calls (needed for OpenFGA)
+RUN apk add --no-cache ca-certificates
+
+# Copy compiled binary
+COPY --from=builder /app/app .
+
+# Copy .env if you want container env file support
+COPY .env .env
+
+EXPOSE 8080
+
+CMD ["./app"]
