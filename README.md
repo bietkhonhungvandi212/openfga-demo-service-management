@@ -1,185 +1,207 @@
-# Open FGA Demo
+# Service Management with OpenFGA
 
 ## Overview
 
-This toy project is setup services management by openfga
+This project demonstrates service-to-service authorization using **OpenFGA** (Open Fine-Grained Authorization) for production-ready service management.
 
-## Guidance setup
-
-### Folder structure
+## Architecture
 
 ```plaintext
-servicer-management/
-│
-├── docker-compose.yml
-├── README.md
-│
-├── model/
-│   └── service-model.fga
-│
-├── service-internal/
-│   ├── dockerfile
-│   ├── go.mod
-│   ├── go.sum
-│   └── main.go
-│
-└── service-caller/
-    ├── dockerfile
-    ├── go.mod
-    ├── go.sum
-    └── main.go
+                          +-----------------------+
+                          |       OpenFGA         |
+                          |  Authorization Server |
+                          |  (relationship store) |
+                          |      (PostgreSQL)     |
+                          +-----------+-----------+
+                                      ^
+                                      |
+                              Permission Check
+                                      |
+                              +-------+--------+
+                              |  Service A     |
+                              |  (Internal API)|
+                              |----------------|
+                              | Auth Middleware|
+                              |  (Caching)     |
+                              +-------+--------+
+                                      ^
+                         HTTP Request |
+                          +-----------+-----------+
+                          |                       |
+                 +--------+--------+     +--------+--------+
+                 | Service Caller A |     | Service Caller C |
+                 |  (Allowed)       |     |   (Denied)       |
+                 +------------------+     +------------------+
 ```
 
-### Architecture
+## Key Features
 
-```plaintext
+### OpenFGA Cluster
+- **PostgreSQL** backend for production-grade persistence
+- **JSON logging** for structured observability
+- **Metrics endpoint** on port 8081
+- **Health checks** for all services
+- **Graceful shutdown** handling
 
-                 +-----------------------+
-                 |       OpenFGA         |
-                 |  Authorization Server |
-                 |  (relationship store) |
-                 +-----------+-----------+
-                             ^
-                             |
-                     Permission Check
-                             |
-                     +-------+--------+
-                     |  Service A     |
-                     |  (Internal API)|
-                     |----------------|
-                     | Auth Middleware|
-                     +-------+--------+
-                             ^
-                HTTP Request |
-                 +-----------+-----------+
-                 |                       |
-        +--------+--------+     +--------+--------+
-        | Service Caller A |     | Service Caller C |
-        |  (Allowed)       |     |   (Denied)       |
-        +------------------+     +------------------+
-```
+### Service-Internal
+- **In-memory caching** for FGA check results (configurable TTL)
+- **Retry logic** with exponential backoff for FGA calls
+- **Structured logging** with zap
+- **Request tracing** with timing information
+- **Graceful shutdown** on SIGTERM/SIGINT
 
-### Set up
+### Service-Caller
+- **HTTP client timeout** configuration
+- **Structured logging** with zap
+- **Health check endpoint**
+- **Graceful shutdown**
 
-install OpenFGA CLI:
+## Quick Start
 
-```bash
-    brew install openfga/tap/fga
-```
+### Prerequisites
+- Docker & Docker Compose
+- OpenFGA CLI (optional, for setup): `brew install openfga/tap/fga`
 
-1. Set up OpenFGA server
-
-```bash
-    docker compose up openfga
-```
-
-2. Create Store
-
-```bash
-    fga store create --name service-auth
-```
-
-The Response:
-
-```json
-{
-  "store": {
-    "created_at": "2026-03-12T14:55:08.915264844Z",
-    "id": "01KKH8PP3KRM77KB8DF589EJ4K",
-    "name": "service-auth",
-    "updated_at": "2026-03-12T14:55:08.915264844Z"
-  }
-}
-```
-
-3. Replace the store id in docker compose
-
-Replace STORE_ID in docker-compose for service-internal
-
-4. Create schema authentication
-
-```bash
-fga model write \
-  --store-id=01KKH8PP3KRM77KB8DF589EJ4K \
-  --file=model/service-model.fga
-```
-
-The response looks like:
-
-```json
-{
-  "authorization_model_id": "01KKH8TP4C8Z9BQCBVS22K44Y4"
-}
-```
-
-you can check again by this command:
-
-```bash
-fga model list --store-id=01KKH8PP3KRM77KB8DF589EJ4K
-```
-
-The response looks like:
-
-```json
-{
-  "authorization_models": [
-    {
-      "id": "01KKH8TP4C8Z9BQCBVS22K44Y4",
-      "created_at": "2026-03-12T14:57:20.012Z"
-    }
-  ]
-}
-```
-
-5.Define permission
-
-```bash
-fga tuple write service:service-caller-a can_call service:service-internal-a \
-  --store-id=01KKH8PP3KRM77KB8DF589EJ4K
-```
-
-the response looks like:
-
-```json
-{
-  "successful": [
-    {
-      "object": "service:service-internal-a",
-      "relation": "can_call",
-      "user": "service:service-caller-a"
-    }
-  ]
-}
-```
-
-6. Start internal + caller services
-
+### 1. Start the Stack
 ```bash
 docker compose up
 ```
 
-7. Now test permission
-
-- Calling to servicer caller A, so this service will call to internal service. The expectation that we will receive the response without forbidden
-
+### 2. Set up OpenFGA (if not already done)
 ```bash
+# Create store
+fga store create --name service-auth
+
+# Note the store ID from response, then update docker-compose.yml
+# Set STORE_ID environment variable in service-internal service
+
+# Write authorization model
+fga model write \
+  --store-id=<YOUR_STORE_ID> \
+  --file=model/service-model.fga
+
+# Define permissions
+fga tuple write service:service-caller-a can_call service:service-internal-a \
+  --store-id=<YOUR_STORE_ID>
+```
+
+### 3. Test
+```bash
+# Allowed caller
 curl 'http://localhost:8083/internal'
-```
 
-the response will be:
-
-```json
-{ "response": "ok", "service": "service-internal" }
-```
-
-- Calling to servicer caller B, so this service will call to internal service. The expectation that we will be forbiddened
-
-```bash
+# Denied caller (if not authorized)
 curl 'http://localhost:8084/internal'
 ```
 
-the response will be:
+## Production Deployment
 
-```json
-{ "response": "{\"error\":\"Forbidden\"}ok", "service": "service-internal" }
+### Environment Variables
+
+#### OpenFGA
+- `OPENFGA_API_URL`: OpenFGA server URL (default: http://openfga:8080)
+- `STORE_ID`: OpenFGA store ID (required)
+
+#### Service-Internal
+- `PORT`: Service port (default: 8080)
+- `NAME`: Service identifier (default: service-internal-a)
+- `LOG_LEVEL`: Logging level (debug, info, warn, error)
+- `LOG_FORMAT`: Logging format (json, console)
+- `FGA_CACHE_ENABLED`: Enable FGA result caching (true/false)
+- `FGA_CACHE_TTL`: Cache TTL duration (e.g., 60s, 5m)
+- `FGA_RETRY_MAX_ATTEMPTS`: Max retry attempts for FGA calls
+- `FGA_RETRY_BACKOFF`: Initial backoff duration
+
+#### Service-Caller
+- `PORT`: Service port (default: 8081)
+- `NAME`: Service identifier (default: service-caller-a)
+- `SERVICE_INTERNAL_A_URL`: Target internal service URL
+- `HTTP_CLIENT_TIMEOUT`: HTTP client timeout (default: 5s)
+- `HTTP_CLIENT_RETRY_MAX_ATTEMPTS`: Max retry attempts
+
+### Docker Compose Settings
+
+Update `docker-compose.yml` for production:
+
+```yaml
+openfga:
+  environment:
+    - OPENFGA_AUTH_METHOD=Bearer
+    - OPENFGA_AUTH_BEARER_TOKEN=<your-token>
+  ports:
+    - "8080:8080"  # OpenFGA API
+    - "8081:8081"  # Metrics
+  volumes:
+    - ./openfga-data:/data  # Persistent storage
 ```
+
+### Logging
+All services use structured JSON logging by default. Logs include:
+- Timestamp
+- Service name
+- Request path and method
+- Response status and duration
+- Error messages with stack traces
+
+### Monitoring
+- **OpenFGA Metrics**: http://localhost:8081/metrics
+- **Service Health**: http://localhost:8080/health
+- **Service Metrics**: Available via JSON logs
+
+### Best Practices
+1. **Use environment variables** for sensitive configuration
+2. **Enable caching** for production workloads
+3. **Configure appropriate timeouts** for your workload
+4. **Use JSON logging** for centralized log aggregation
+5. **Enable health checks** in your orchestration system
+6. **Configure resource limits** in Docker/Kubernetes
+7. **Use TLS** for inter-service communication in production
+
+## Troubleshooting
+
+### Service not authorized
+Check OpenFGA tuples:
+```bash
+fga tuple list --store-id=<STORE_ID> --filter user=service:service-caller-a
+```
+
+### OpenFGA not starting
+Check PostgreSQL health:
+```bash
+docker compose logs postgres
+```
+
+### High latency
+- Enable FGA caching: `FGA_CACHE_ENABLED=true`
+- Increase cache TTL: `FGA_CACHE_TTL=5m`
+- Check network latency between services
+
+## Folder Structure
+
+```plaintext
+servicer-management/
+├── docker-compose.yml          # Services orchestration
+├── README.md                   # This file
+├── model/
+│   └── service-model.fga       # OpenFGA authorization model
+├── service-internal/
+│   ├── dockerfile              # Docker configuration
+│   ├── go.mod                  # Go dependencies
+│   └── main.go                 # Internal service with auth middleware
+└── service-caller/
+    ├── dockerfile              # Docker configuration
+    ├── go.mod                  # Go dependencies
+    └── main.go                 # Caller service
+```
+
+## Authorization Model
+
+The `service-model.fga` defines a simple service-to-service authorization:
+
+```fga
+type service
+  relations
+    define can_call: [service]
+```
+
+This allows services to grant calling permissions to other services.

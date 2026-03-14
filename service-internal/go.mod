@@ -1,10 +1,11 @@
-module service-interal
+module service-internal
 
 go 1.25.0
 
 require (
 	github.com/gin-gonic/gin v1.12.0
 	github.com/openfga/go-sdk v0.7.5
+	go.uber.org/zap v1.27.0
 )
 
 require (
@@ -39,8 +40,7 @@ require (
 	go.opentelemetry.io/otel v1.40.0 // indirect
 	go.opentelemetry.io/otel/metric v1.40.0 // indirect
 	go.opentelemetry.io/otel/trace v1.40.0 // indirect
-	go.uber.org/atomic v1.7.0 // indirect
-	go.uber.org/multierr v1.9.0 // indirect
+	go.uber.org/multierr v1.10.0 // indirect
 	golang.org/x/arch v0.22.0 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/net v0.51.0 // indirect

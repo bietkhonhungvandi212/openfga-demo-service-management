@@ -2,15 +2,50 @@ version: "3.9"
 
 networks:
   app-net:
+    driver: bridge
 
 services:
-  openfga:
-    image: openfga/openfga:latest
-    command: run
-    ports:
-      - "8080:8080"
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: openfga
+      POSTGRES_PASSWORD: openfga
+      POSTGRES_DB: openfga
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     networks:
       - app-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openfga"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  openfga:
+    image: openfga/openfga:latest
+    command:
+      - run
+      - --datastore-engine=postgres
+      - --datastore-uri=postgres://openfga:openfga@postgres:5432/openfga?sslmode=disable
+      - --log-format=json
+      - --log-level=info
+      - --metrics-enabled=true
+      - --metrics-addr=0.0.0.0:8081
+      - --trace-enabled=false
+      - --playground-enabled=false
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   service-internal:
     build:
@@ -18,16 +53,28 @@ services:
       dockerfile: dockerfile
     container_name: service-internal
     depends_on:
-      - openfga
+      openfga:
+        condition: service_healthy
     environment:
       PORT: "8080"
       NAME: service-internal-a
       OPENFGA_API: http://openfga:8080
       STORE_ID: 01KKH8PP3KRM77KB8DF589EJ4K
+      LOG_LEVEL: info
+      LOG_FORMAT: json
+      FGA_CACHE_ENABLED: "true"
+      FGA_CACHE_TTL: "60s"
+      FGA_RETRY_MAX_ATTEMPTS: "3"
+      FGA_RETRY_BACKOFF: "100ms"
     ports:
       - "8082:8080"
     networks:
       - app-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   service-caller-a:
     build:
@@ -35,15 +82,25 @@ services:
       dockerfile: Dockerfile
     container_name: service-caller-a
     depends_on:
-      - service-internal
+      service-internal:
+        condition: service_healthy
     environment:
       PORT: "8081"
       NAME: service-caller-a
       SERVICE_INTERNAL_A_URL: http://service-internal:8080
+      LOG_LEVEL: info
+      LOG_FORMAT: json
+      HTTP_CLIENT_TIMEOUT: "5s"
+      HTTP_CLIENT_RETRY_MAX_ATTEMPTS: "3"
     ports:
       - "8083:8081"
     networks:
       - app-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   service-caller-b:
     build:
@@ -51,12 +108,25 @@ services:
       dockerfile: Dockerfile
     container_name: service-caller-b
     depends_on:
-      - service-internal
+      service-internal:
+        condition: service_healthy
     environment:
       PORT: "8081"
       NAME: service-caller-b
       SERVICE_INTERNAL_A_URL: http://service-internal:8080
+      LOG_LEVEL: info
+      LOG_FORMAT: json
+      HTTP_CLIENT_TIMEOUT: "5s"
+      HTTP_CLIENT_RETRY_MAX_ATTEMPTS: "3"
     ports:
       - "8084:8081"
     networks:
       - app-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
