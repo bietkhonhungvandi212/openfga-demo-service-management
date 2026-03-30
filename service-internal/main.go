@@ -6,14 +6,19 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	client "github.com/openfga/go-sdk/client"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+
+	"service-internal/config"
+	"service-internal/middleware"
 )
 
 var (
@@ -21,87 +26,158 @@ var (
 )
 
 func main() {
-	// Initialize logger
-	initLogger()
+	cfg := config.Load()
+	initLogger(cfg.LogLevel, cfg.LogFormat)
+	logger = zap.L()
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	apiVersion := cfg.APIVersion
+	if !strings.HasPrefix(apiVersion, "v") {
+		apiVersion = "v" + apiVersion
 	}
 
-	name := os.Getenv("NAME")
-	if name == "" {
-		name = "service-internal-a"
-	}
+	fga := NewFGA(cfg)
 
-	// Initialize OpenFGA client with retry
-	fga := NewFGA()
-
-	// Create router
 	router := gin.New()
 
-	// Add middlewares
 	router.Use(gin.Recovery())
-	router.Use(loggingMiddleware())
-	router.Use(Authorize(fga, name))
+	router.Use(middleware.CorrelationIDMiddleware())
+	router.Use(middleware.RequestLoggerMiddleware())
+	router.Use(middleware.MetricsMiddleware())
+	router.Use(middleware.SecurityHeadersMiddleware())
 
-	// Health endpoint
-	router.GET("/health", func(c *gin.Context) {
+	if cfg.FeatureRateLimiting {
+		rateLimiter := middleware.NewRateLimiter(cfg.RateLimitRequestsPerSecond, cfg.RateLimitBurst, cfg.RateLimitEnabled)
+		router.Use(middleware.RateLimitMiddleware(rateLimiter))
+	}
+
+	if cfg.FeatureCircuitBreaker {
+		middleware.InitCircuitBreaker(middleware.CircuitBreakerConfig{
+			Enabled:          cfg.FeatureCircuitBreaker,
+			FailureThreshold: 5,
+			SuccessThreshold: 2,
+			Timeout:          30 * time.Second,
+			Name:             "fga-circuit-breaker",
+		})
+	}
+
+	var idempotencyStore *middleware.IdempotencyStore
+	if cfg.FeatureIdempotency {
+		idempotencyStore = middleware.NewIdempotencyStore(cfg.IdempotencyCacheTTL)
+		go cleanupIdempotencyStore(idempotencyStore)
+		router.Use(middleware.IdempotencyMiddleware(idempotencyStore, cfg.FeatureIdempotency))
+	}
+
+	healthHandler := middleware.NewHealthHandler(cfg.Name, cfg.ServiceVersion, fga)
+	versionHandler := middleware.NewVersionHandler(cfg.ServiceVersion, cfg.GitCommit, cfg.BuildTime)
+
+	router.GET("/health/live", healthHandler.Liveness)
+	router.GET("/health/ready", healthHandler.Readiness)
+	router.GET("/version", versionHandler.GetVersion)
+
+	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
+
+	corsConfig := middleware.CORSConfig{
+		AllowedOrigins: cfg.CORSAllowedOrigins,
+		AllowedMethods: cfg.CORSAllowedMethods,
+		AllowedHeaders: cfg.CORSAllowedHeaders,
+		MaxAge:         cfg.CORSMaxAge,
+	}
+	router.Use(middleware.CORSMiddleware(corsConfig))
+
+	api := router.Group(fmt.Sprintf("/api/%s", apiVersion))
+	api.Use(func(c *gin.Context) {
+		c.Header("X-API-Version", apiVersion)
+		c.Next()
+	})
+	api.Use(middleware.RequestValidationMiddleware())
+	if cfg.FeatureIdempotency {
+		api.Use(middleware.IdempotencyMiddleware(idempotencyStore, cfg.FeatureIdempotency))
+	}
+	api.Use(Authorize(fga, cfg.Name))
+	{
+		api.GET("/internal", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{
+				"service":   cfg.Name,
+				"status":    "ok",
+				"message":   "internal service reached successfully",
+				"timestamp": time.Now().Format(time.RFC3339),
+			})
+		})
+	}
+
+	router.Any("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"status":  "healthy",
-			"service": name,
+			"service": cfg.Name,
 			"time":    time.Now().Format(time.RFC3339),
 		})
 	})
 
-	// Create server
 	srv := &http.Server{
-		Addr:    ":" + port,
-		Handler: router,
+		Addr:         ":" + cfg.Port,
+		Handler:      router,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  30 * time.Second,
 	}
 
-	// Start server in goroutine
 	go func() {
-		logger.Info("Starting server", zap.String("port", port), zap.String("service", name))
+		logger.Info("Starting server",
+			zap.String("port", cfg.Port),
+			zap.String("service", cfg.Name),
+			zap.String("version", cfg.APIVersion),
+		)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Fatal("Failed to start server", zap.Error(err))
 		}
 	}()
 
-	// Wait for interrupt signal
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGHUP)
+		for {
+			sig := <-sigChan
+			if sig == syscall.SIGHUP {
+				logger.Info("Received SIGHUP, reloading configuration")
+				if err := config.Reload(); err != nil {
+					logger.Error("Configuration reload failed", zap.Error(err))
+				} else {
+					logger.Info("Configuration reloaded successfully")
+					newCfg := config.Get()
+					applyLogLevel(newCfg.LogLevel)
+				}
+			}
+		}
+	}()
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	logger.Info("Shutting down server...")
+	logger.Info("Shutting down server gracefully")
+	middleware.SetShuttingDown(true)
 
-	// Create a deadline to wait for
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 
 	if err := srv.Shutdown(ctx); err != nil {
-		logger.Fatal("Server forced to shutdown", zap.Error(err))
+		logger.Error("Server forced to shutdown", zap.Error(err))
 	}
 
-	logger.Info("Server exited")
+	logger.Info("Server exited gracefully")
 }
 
-func initLogger() {
-	logLevel := os.Getenv("LOG_LEVEL")
-	if logLevel == "" {
-		logLevel = "info"
-	}
-
-	logFormat := os.Getenv("LOG_FORMAT")
-	if logFormat == "" {
-		logFormat = "json"
-	}
-
+func initLogger(logLevel, logFormat string) {
 	config := zap.NewProductionConfig()
 	config.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
 
-	if logLevel == "debug" {
+	switch strings.ToLower(logLevel) {
+	case "debug":
 		config.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
+	case "warn":
+		config.Level = zap.NewAtomicLevelAt(zap.WarnLevel)
+	case "error":
+		config.Level = zap.NewAtomicLevelAt(zap.ErrorLevel)
 	}
 
 	if logFormat == "console" {
@@ -116,24 +192,7 @@ func initLogger() {
 	}
 }
 
-func loggingMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		start := time.Now()
-		path := c.Request.URL.Path
-		query := c.Request.URL.RawQuery
-
-		c.Next()
-
-		duration := time.Since(start)
-		logger.Info("Request",
-			zap.String("method", c.Request.Method),
-			zap.String("path", path),
-			zap.String("query", query),
-			zap.Int("status", c.Writer.Status()),
-			zap.Duration("duration", duration),
-			zap.String("client_ip", c.ClientIP()),
-		)
-	}
+func applyLogLevel(logLevel string) {
 }
 
 type FGAAuth struct {
@@ -149,60 +208,42 @@ type cacheEntry struct {
 	expires time.Time
 }
 
-func NewFGA() *FGAAuth {
-	cfg := &client.ClientConfiguration{
-		ApiUrl:  os.Getenv("OPENFGA_API"),
-		StoreId: os.Getenv("STORE_ID"),
+func NewFGA(cfg *config.Config) *FGAAuth {
+	cfg2 := &client.ClientConfiguration{
+		ApiUrl:  cfg.OpenFGAAPI,
+		StoreId: cfg.StoreID,
 	}
 
-	fga, err := client.NewSdkClient(cfg)
+	fga, err := client.NewSdkClient(cfg2)
 	if err != nil {
 		logger.Fatal("Failed to create OpenFGA client", zap.Error(err))
-	}
-
-	// Parse cache settings
-	cacheEnabled := os.Getenv("FGA_CACHE_ENABLED") == "true"
-	cacheTTL := 60 * time.Second
-	if ttlStr := os.Getenv("FGA_CACHE_TTL"); ttlStr != "" {
-		if parsed, err := time.ParseDuration(ttlStr); err == nil {
-			cacheTTL = parsed
-		}
 	}
 
 	return &FGAAuth{
 		client:       fga,
 		cache:        make(map[string]cacheEntry),
-		cacheTTL:     cacheTTL,
-		cacheEnabled: cacheEnabled,
+		cacheTTL:     cfg.FGACacheTTL,
+		cacheEnabled: cfg.FGACacheEnabled && cfg.FeatureFGACache,
 	}
 }
 
 func (f *FGAAuth) CheckWithRetry(ctx context.Context, req client.ClientCheckRequest) (bool, error) {
 	maxAttempts := 3
-	if maxStr := os.Getenv("FGA_RETRY_MAX_ATTEMPTS"); maxStr != "" {
-		if parsed, err := fmt.Sscanf(maxStr, "%d", &maxAttempts); err == nil && parsed > 0 {
-			maxAttempts = parsed
-		}
-	}
-
 	backoffBase := 100 * time.Millisecond
-	if backoffStr := os.Getenv("FGA_RETRY_BACKOFF"); backoffStr != "" {
-		if parsed, err := time.ParseDuration(backoffStr); err == nil {
-			backoffBase = parsed
-		}
-	}
 
-	// Check cache first
 	cacheKey := fmt.Sprintf("%s:%s:%s", req.User, req.Relation, req.Object)
 	if f.cacheEnabled {
 		f.mu.Lock()
 		entry, found := f.cache[cacheKey]
 		f.mu.Unlock()
 		if found && time.Now().Before(entry.expires) {
+			middleware.RecordFGACacheHit(true)
 			return entry.allowed, nil
 		}
+		middleware.RecordFGACacheHit(false)
 	}
 
+	start := time.Now()
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		resp, err := f.client.Check(ctx).
@@ -211,8 +252,9 @@ func (f *FGAAuth) CheckWithRetry(ctx context.Context, req client.ClientCheckRequ
 
 		if err == nil && resp != nil && resp.Allowed != nil {
 			allowed := *resp.Allowed
+			duration := time.Since(start)
+			middleware.RecordFGACheckDuration(duration)
 
-			// Cache the result
 			if f.cacheEnabled {
 				f.mu.Lock()
 				f.cache[cacheKey] = cacheEntry{
@@ -220,6 +262,12 @@ func (f *FGAAuth) CheckWithRetry(ctx context.Context, req client.ClientCheckRequ
 					expires: time.Now().Add(f.cacheTTL),
 				}
 				f.mu.Unlock()
+			}
+
+			if allowed {
+				middleware.RecordFGAAuthorization("allowed")
+			} else {
+				middleware.RecordFGAAuthorization("denied")
 			}
 
 			return allowed, nil
@@ -232,6 +280,7 @@ func (f *FGAAuth) CheckWithRetry(ctx context.Context, req client.ClientCheckRequ
 		}
 	}
 
+	middleware.RecordFGAAuthorization("error")
 	logger.Error("FGA check failed after retries",
 		zap.Int("attempts", maxAttempts),
 		zap.Error(lastErr),
@@ -240,9 +289,33 @@ func (f *FGAAuth) CheckWithRetry(ctx context.Context, req client.ClientCheckRequ
 	return false, lastErr
 }
 
+func (f *FGAAuth) CheckHealth() (bool, string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	req := client.ClientCheckRequest{
+		User:     "service:health-check",
+		Relation: "can_call",
+		Object:   "service:health",
+	}
+
+	_, err := f.client.Check(ctx).Body(req).Execute()
+	if err != nil {
+		return false, "unhealthy"
+	}
+	return true, "healthy"
+}
+
+func cleanupIdempotencyStore(store *middleware.IdempotencyStore) {
+	ticker := time.NewTicker(5 * time.Minute)
+	for range ticker.C {
+		store.Cleanup()
+	}
+}
+
 func Authorize(fga *FGAAuth, serviceName string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		caller := c.Request.Header.Get("X-Service-Name")
+		caller := c.GetHeader("X-Service-Name")
 		if caller == "" {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error": "Missing X-Service-Name header",

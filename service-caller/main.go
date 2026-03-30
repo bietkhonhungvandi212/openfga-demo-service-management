@@ -7,193 +7,271 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+
+	"service-caller/config"
+	"service-caller/middleware"
 )
 
 var (
 	logger *zap.Logger
 )
 
-func main() {
-	// Initialize logger
-	initLogger()
+type DependencyChecker struct {
+	url string
+}
 
-	serviceURL := os.Getenv("SERVICE_INTERNAL_A_URL")
-	port := os.Getenv("PORT")
-	name := os.Getenv("NAME")
+func (d *DependencyChecker) CheckHealth() (bool, string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
-	if port == "" {
-		port = "8081"
-	}
-
-	if name == "" {
-		name = "service-caller-a"
-	}
-
-	if serviceURL == "" {
-		logger.Fatal("SERVICE_INTERNAL_A_URL environment variable is required")
-	}
-
-	// Create HTTP client with timeout
-	timeoutStr := os.Getenv("HTTP_CLIENT_TIMEOUT")
-	if timeoutStr == "" {
-		timeoutStr = "5s"
-	}
-	timeout, err := time.ParseDuration(timeoutStr)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.url+"/health/live", nil)
 	if err != nil {
-		timeout = 5 * time.Second
+		return false, "unhealthy"
 	}
 
-	client := &http.Client{
-		Timeout: timeout,
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, "unhealthy"
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		return true, "healthy"
+	}
+	return false, "unhealthy"
+}
+
+func main() {
+	cfg := config.Load()
+	initLogger(cfg.LogLevel, cfg.LogFormat)
+	logger = zap.L()
+
+	middleware.ServiceName = cfg.Name
+	middleware.SetServiceInfo(cfg.Name, "")
+
+	apiVersion := cfg.APIVersion
+	if !strings.HasPrefix(apiVersion, "v") {
+		apiVersion = "v" + apiVersion
 	}
 
-	// Create router
+	httpClient := createHTTPClient(cfg)
+
 	router := gin.New()
-	router.Use(gin.Recovery())
-	router.Use(loggingMiddleware())
 
-	// Health endpoint
-	router.GET("/health", func(c *gin.Context) {
+	router.Use(gin.Recovery())
+	router.Use(middleware.CorrelationIDMiddleware())
+	router.Use(middleware.RequestLoggerMiddleware())
+	router.Use(middleware.MetricsMiddleware())
+	router.Use(middleware.SecurityHeadersMiddleware())
+
+	if cfg.FeatureRateLimiting {
+		rateLimiter := middleware.NewRateLimiter(cfg.RateLimitRequestsPerSecond, cfg.RateLimitBurst, cfg.RateLimitEnabled)
+		router.Use(middleware.RateLimitMiddleware(rateLimiter))
+	}
+
+	if cfg.FeatureCircuitBreaker {
+		middleware.InitCircuitBreaker(middleware.CircuitBreakerConfig{
+			Enabled:          cfg.FeatureCircuitBreaker,
+			FailureThreshold: 5,
+			SuccessThreshold: 2,
+			Timeout:          30 * time.Second,
+			Name:             "internal-service-breaker",
+		})
+	}
+
+	var idempotencyStore *middleware.IdempotencyStore
+	if cfg.FeatureIdempotency {
+		idempotencyStore = middleware.NewIdempotencyStore(cfg.IdempotencyCacheTTL)
+		go cleanupIdempotencyStore(idempotencyStore)
+		router.Use(middleware.IdempotencyMiddleware(idempotencyStore, cfg.FeatureIdempotency))
+	}
+
+	corsConfig := middleware.CORSConfig{
+		AllowedOrigins: cfg.CORSAllowedOrigins,
+		AllowedMethods: cfg.CORSAllowedMethods,
+		AllowedHeaders: cfg.CORSAllowedHeaders,
+		MaxAge:         cfg.CORSMaxAge,
+	}
+	router.Use(middleware.CORSMiddleware(corsConfig))
+
+	healthHandler := middleware.NewHealthHandler(cfg.Name, cfg.ServiceVersion, &DependencyChecker{url: cfg.ServiceInternalURL})
+	versionHandler := middleware.NewVersionHandler(cfg.ServiceVersion, cfg.GitCommit, cfg.BuildTime)
+
+	router.GET("/health/live", healthHandler.Liveness)
+	router.GET("/health/ready", healthHandler.Readiness)
+	router.GET("/version", versionHandler.GetVersion)
+
+	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
+
+	api := router.Group(fmt.Sprintf("/api/%s", apiVersion))
+	api.Use(middleware.RequestValidationMiddleware())
+	if cfg.FeatureIdempotency {
+		api.Use(middleware.IdempotencyMiddleware(idempotencyStore, cfg.FeatureIdempotency))
+	}
+	{
+		api.GET("/internal", func(c *gin.Context) {
+			requestID, _ := c.Get("request_id")
+
+			req, reqErr := http.NewRequest(http.MethodGet, cfg.ServiceInternalURL+"/api/v1/internal", nil)
+			if reqErr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot create request"})
+				return
+			}
+
+			req.Header.Add("X-Service-Name", cfg.Name)
+			req.Header.Add("X-Request-ID", requestID.(string))
+
+			ctx, cancel := context.WithTimeout(c.Request.Context(), cfg.HTTPClientTimeout)
+			defer cancel()
+			req = req.WithContext(ctx)
+
+			start := time.Now()
+			resp, doErr := httpClient.Do(req)
+			duration := time.Since(start)
+
+			if doErr != nil {
+				middleware.RecordHTTPClientRequest(http.MethodGet, cfg.ServiceInternalURL, "error", duration)
+				logger.Error("Failed to call internal service",
+					zap.Error(doErr),
+					zap.String("request_id", requestID.(string)),
+				)
+				c.JSON(http.StatusServiceUnavailable, gin.H{
+					"error": "cannot reach internal service",
+				})
+				return
+			}
+			defer resp.Body.Close()
+
+			middleware.RecordHTTPClientRequest(http.MethodGet, cfg.ServiceInternalURL, fmt.Sprintf("%d", resp.StatusCode), duration)
+
+			body, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot read response"})
+				return
+			}
+
+			c.Header("X-API-Version", apiVersion)
+			c.JSON(resp.StatusCode, gin.H{
+				"service":   "service-internal",
+				"response":  string(body),
+				"status":    resp.StatusCode,
+				"timestamp": time.Now().Format(time.RFC3339),
+			})
+		})
+	}
+
+	router.Any("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"status":  "healthy",
-			"service": name,
+			"service": cfg.Name,
 			"time":    time.Now().Format(time.RFC3339),
 		})
 	})
 
-	// Internal endpoint that calls service-internal
-	router.GET("/internal", func(c *gin.Context) {
-		req, err := http.NewRequest(http.MethodGet, serviceURL+"/health", nil)
-		if err != nil {
-			logger.Error("Failed to create request", zap.Error(err))
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": "cannot create request",
-			})
-			return
-		}
-
-		req.Header.Add("X-Service-Name", name)
-
-		ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
-		defer cancel()
-
-		req = req.WithContext(ctx)
-
-		resp, err := client.Do(req)
-		if err != nil {
-			logger.Error("Failed to call internal service", zap.Error(err))
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error": "cannot reach internal service",
-			})
-			return
-		}
-		defer resp.Body.Close()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			logger.Error("Failed to read response body", zap.Error(err))
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": "cannot read response",
-			})
-			return
-		}
-
-		logger.Info("Call to internal service successful",
-			zap.String("caller", name),
-			zap.String("status", fmt.Sprintf("%d", resp.StatusCode)),
-		)
-
-		c.JSON(http.StatusOK, gin.H{
-			"service":  "service-internal",
-			"response": string(body),
-			"status":   resp.StatusCode,
-		})
-	})
-
-	// Create server
 	srv := &http.Server{
-		Addr:    ":" + port,
-		Handler: router,
+		Addr:         ":" + cfg.Port,
+		Handler:      router,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  30 * time.Second,
 	}
 
-	// Start server in goroutine
 	go func() {
-		logger.Info("Starting server", zap.String("port", port), zap.String("service", name))
+		logger.Info("Starting server",
+			zap.String("port", cfg.Port),
+			zap.String("service", cfg.Name),
+			zap.String("version", cfg.APIVersion),
+		)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Fatal("Failed to start server", zap.Error(err))
 		}
 	}()
 
-	// Wait for interrupt signal
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGHUP)
+		for {
+			sig := <-sigChan
+			if sig == syscall.SIGHUP {
+				logger.Info("Received SIGHUP, reloading configuration")
+				if err := config.Reload(); err != nil {
+					logger.Error("Configuration reload failed", zap.Error(err))
+				} else {
+					logger.Info("Configuration reloaded successfully")
+				}
+			}
+		}
+	}()
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	logger.Info("Shutting down server...")
+	logger.Info("Shutting down server gracefully")
+	middleware.SetShuttingDown(true)
 
-	// Create a deadline to wait for
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 
 	if err := srv.Shutdown(ctx); err != nil {
-		logger.Fatal("Server forced to shutdown", zap.Error(err))
+		logger.Error("Server forced to shutdown", zap.Error(err))
 	}
 
-	logger.Info("Server exited")
+	logger.Info("Server exited gracefully")
 }
 
-func initLogger() {
-	logLevel := os.Getenv("LOG_LEVEL")
-	if logLevel == "" {
-		logLevel = "info"
-	}
+func initLogger(logLevel, logFormat string) {
+	cfg := zap.NewProductionConfig()
+	cfg.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
 
-	logFormat := os.Getenv("LOG_FORMAT")
-	if logFormat == "" {
-		logFormat = "json"
-	}
-
-	config := zap.NewProductionConfig()
-	config.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
-
-	if logLevel == "debug" {
-		config.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
+	switch strings.ToLower(logLevel) {
+	case "debug":
+		cfg.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
+	case "warn":
+		cfg.Level = zap.NewAtomicLevelAt(zap.WarnLevel)
+	case "error":
+		cfg.Level = zap.NewAtomicLevelAt(zap.ErrorLevel)
 	}
 
 	if logFormat == "console" {
-		config.Encoding = "console"
-		config.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+		cfg.Encoding = "console"
+		cfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
 	}
 
 	var err error
-	logger, err = config.Build()
+	logger, err = cfg.Build()
 	if err != nil {
 		panic(err)
 	}
 }
 
-func loggingMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		start := time.Now()
-		path := c.Request.URL.Path
-		query := c.Request.URL.RawQuery
+func createHTTPClient(cfg *config.Config) *http.Client {
+	transport := &http.Transport{
+		MaxIdleConns:          cfg.HTTPMaxIdleConnections,
+		MaxIdleConnsPerHost:   cfg.HTTPMaxIdlePerHost,
+		IdleConnTimeout:       cfg.HTTPIdleConnectionTimeout,
+		ResponseHeaderTimeout: cfg.HTTPClientTimeout,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 
-		c.Next()
+	return &http.Client{
+		Transport: transport,
+		Timeout:   cfg.HTTPClientTimeout,
+	}
+}
 
-		duration := time.Since(start)
-		logger.Info("Request",
-			zap.String("method", c.Request.Method),
-			zap.String("path", path),
-			zap.String("query", query),
-			zap.Int("status", c.Writer.Status()),
-			zap.Duration("duration", duration),
-			zap.String("client_ip", c.ClientIP()),
-		)
+func cleanupIdempotencyStore(store *middleware.IdempotencyStore) {
+	ticker := time.NewTicker(5 * time.Minute)
+	for range ticker.C {
+		store.Cleanup()
 	}
 }
