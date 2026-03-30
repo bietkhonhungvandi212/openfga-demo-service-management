@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"math/rand"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,6 +15,24 @@ const (
 	HeaderIdempotencyKey = "X-Idempotency-Key"
 	HeaderAPIVersion     = "X-API-Version"
 )
+
+var logSampleRate float64 = 1.0
+var isProduction = false
+
+func SetLogSampleRate(rate float64) {
+	logSampleRate = rate
+}
+
+func SetProductionMode(prod bool) {
+	isProduction = prod
+}
+
+func shouldSample() bool {
+	if logSampleRate >= 1.0 {
+		return true
+	}
+	return rand.Float64() < logSampleRate
+}
 
 func CorrelationIDMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -41,6 +60,10 @@ func RequestLoggerMiddleware() gin.HandlerFunc {
 		query := c.Request.URL.RawQuery
 
 		c.Next()
+
+		if !shouldSample() {
+			return
+		}
 
 		duration := time.Since(start)
 		status := c.Writer.Status()
